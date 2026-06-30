@@ -231,6 +231,7 @@ def upsert_channel(account_id: str, target: str, source: str) -> None:
             found = True
             body = section_lines[1:] if section_lines and section_lines[0].strip() == "[channel]" else section_lines
             body = replace_or_append(body, "type", "wechat")
+            body = replace_or_append(body, "backend", source)
             body = replace_or_append(body, "account_id", account_id)
             body = replace_or_append(body, "target", target)
             next_sections.append((name, ["[channel]"] + body))
@@ -246,6 +247,7 @@ def upsert_channel(account_id: str, target: str, source: str) -> None:
                 [
                     "[channel]",
                     'type = "wechat"',
+                    f"backend = {json.dumps(source, ensure_ascii=False)}",
                     f"account_id = {json.dumps(account_id, ensure_ascii=False)}",
                     f"target = {json.dumps(target, ensure_ascii=False)}",
                 ],

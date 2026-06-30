@@ -39,6 +39,7 @@ RELEASES_DIR="$INSTALL_ROOT/releases"
 CURRENT_LINK="$INSTALL_ROOT/current"
 PREVIOUS_VERSION_FILE="$INSTALL_ROOT/.previous_version"
 BACKUP_DIR="$DATA_DIR/backups"
+SUDO=(sudo)
 
 log() {
   printf '\n[superhealth] %s\n' "$*"
@@ -122,10 +123,12 @@ require_ubuntu() {
 require_sudo() {
   log "Checking sudo access"
   if sudo -n true 2>/dev/null; then
+    SUDO=(sudo -n)
     return
   fi
   if [[ -t 0 ]]; then
     sudo -v
+    SUDO=(sudo)
     return
   fi
   echo "sudo requires a password, but this installer is not running in an interactive terminal." >&2
@@ -135,7 +138,7 @@ require_sudo() {
 
 install_system_dependencies() {
   log "Installing Ubuntu system dependencies"
-  sudo apt-get update
+  "${SUDO[@]}" apt-get update
 
   local packages=(
     git curl wget ca-certificates openssh-client jq tar gzip \
@@ -164,13 +167,13 @@ install_system_dependencies() {
   add_first_available_package libasound2t64 libasound2
   add_first_available_package libatspi2.0-0t64 libatspi2.0-0
 
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+  "${SUDO[@]}" DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
 }
 
 enable_user_linger() {
   if command -v loginctl >/dev/null 2>&1; then
     log "Enabling user service persistence"
-    sudo loginctl enable-linger "$(id -un)" || true
+    "${SUDO[@]}" loginctl enable-linger "$(id -un)" || true
   fi
 }
 

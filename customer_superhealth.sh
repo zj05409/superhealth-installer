@@ -107,6 +107,169 @@ install_local_command() {
   esac
 }
 
+configure_channel_from_local_messaging() {
+  if [[ "${SUPERHEALTH_DISABLE_CHANNEL_AUTOCONFIG:-0}" == "1" ]]; then
+    return
+  fi
+
+  log "Auto-configuring local messaging channel"
+  python3 - <<'PY'
+import json
+from pathlib import Path
+
+home = Path.home()
+config_path = home / ".superhealth" / "config.toml"
+
+
+def load_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
+
+
+def discover_hermes():
+    accounts_dir = home / ".hermes" / "weixin" / "accounts"
+    accounts_index = home / ".hermes" / "weixin" / "accounts.json"
+    candidates = []
+    index = load_json(accounts_index)
+    if isinstance(index, list):
+        candidates.extend(str(item) for item in index)
+    if accounts_dir.exists():
+        files = sorted(
+            accounts_dir.glob("*-im-bot.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        candidates.extend(path.stem for path in files)
+
+    seen = set()
+    for account_id in candidates:
+        if account_id in seen:
+            continue
+        seen.add(account_id)
+        account_file = accounts_dir / f"{account_id}.json"
+        data = load_json(account_file)
+        if not isinstance(data, dict):
+            continue
+        target = str(data.get("userId") or data.get("target") or "").strip()
+        if account_id and target:
+            return account_id, target, "hermes"
+    return "", "", ""
+
+
+def discover_openclaw():
+    accounts_dir = home / ".openclaw" / "openclaw-weixin" / "accounts"
+    accounts_index = home / ".openclaw" / "openclaw-weixin" / "accounts.json"
+    candidates = []
+    index = load_json(accounts_index)
+    if isinstance(index, dict):
+        candidates.extend(str(key) for key in index.keys())
+    elif isinstance(index, list):
+        candidates.extend(str(item) for item in index)
+    if accounts_dir.exists():
+        files = sorted(
+            accounts_dir.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        candidates.extend(path.stem for path in files)
+
+    seen = set()
+    for account_id in candidates:
+        if account_id in seen:
+            continue
+        seen.add(account_id)
+        account_file = accounts_dir / f"{account_id}.json"
+        data = load_json(account_file)
+        if not isinstance(data, dict):
+            continue
+        target = str(data.get("userId") or data.get("target") or "").strip()
+        if account_id and target:
+            return account_id, target, "openclaw"
+    return "", "", ""
+
+
+def replace_or_append(section: list[str], key: str, value: str) -> list[str]:
+    rendered = json.dumps(value, ensure_ascii=False)
+    prefix = f"{key} "
+    out = []
+    replaced = False
+    for line in section:
+        stripped = line.strip()
+        if stripped.startswith(prefix) or stripped.startswith(f"{key}="):
+            out.append(f"{key} = {rendered}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"{key} = {rendered}")
+    return out
+
+
+def upsert_channel(account_id: str, target: str, source: str) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = config_path.read_text().splitlines() if config_path.exists() else []
+
+    sections: list[tuple[str, list[str]]] = []
+    current_name = ""
+    current_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            sections.append((current_name, current_lines))
+            current_name = stripped.strip("[]")
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+    sections.append((current_name, current_lines))
+
+    found = False
+    next_sections = []
+    for name, section_lines in sections:
+        if name == "channel":
+            found = True
+            body = section_lines[1:] if section_lines and section_lines[0].strip() == "[channel]" else section_lines
+            body = replace_or_append(body, "type", "wechat")
+            body = replace_or_append(body, "account_id", account_id)
+            body = replace_or_append(body, "target", target)
+            next_sections.append((name, ["[channel]"] + body))
+        else:
+            next_sections.append((name, section_lines))
+
+    if not found:
+        if next_sections and next_sections[-1][1] and next_sections[-1][1][-1] != "":
+            next_sections[-1][1].append("")
+        next_sections.append(
+            (
+                "channel",
+                [
+                    "[channel]",
+                    'type = "wechat"',
+                    f"account_id = {json.dumps(account_id, ensure_ascii=False)}",
+                    f"target = {json.dumps(target, ensure_ascii=False)}",
+                ],
+            )
+        )
+
+    rendered_lines: list[str] = []
+    for _name, section_lines in next_sections:
+        rendered_lines.extend(section_lines)
+    config_path.write_text("\n".join(rendered_lines).rstrip() + "\n")
+    config_path.chmod(0o600)
+    print(f"[superhealth] Channel auto-configured from {source}: account_id={account_id} target={target}")
+
+
+account_id, target, source = discover_hermes()
+if not account_id:
+    account_id, target, source = discover_openclaw()
+if not account_id:
+    print("[superhealth] No Hermes/OpenClaw local messaging account found; channel config unchanged.")
+else:
+    upsert_channel(account_id, target, source)
+PY
+}
+
 require_ubuntu() {
   if [[ ! -f /etc/os-release ]]; then
     echo "Cannot detect OS: /etc/os-release not found" >&2
@@ -464,6 +627,7 @@ install_flow() {
   version="$(build_release_from_source)"
   stop_services
   activate_release "$version"
+  configure_channel_from_local_messaging
   start_services
   validate_installation
   log "Installed version: $version"
@@ -490,6 +654,7 @@ upgrade_flow() {
   if ! (
     stop_services
     activate_release "$version"
+    configure_channel_from_local_messaging
     start_services
     validate_installation
   ); then

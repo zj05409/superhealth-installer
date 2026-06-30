@@ -42,7 +42,7 @@ BACKUP_DIR="$DATA_DIR/backups"
 SUDO=(sudo)
 
 log() {
-  printf '\n[superhealth] %s\n' "$*"
+  printf '\n[superhealth] %s\n' "$*" >&2
 }
 
 usage() {

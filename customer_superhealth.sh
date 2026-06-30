@@ -97,7 +97,9 @@ install_local_command() {
     echo "Cannot install local command because script path is not a file: $SCRIPT_PATH" >&2
     return
   fi
-  cp "$SCRIPT_PATH" "$COMMAND_PATH"
+  if [[ ! -e "$COMMAND_PATH" || ! "$SCRIPT_PATH" -ef "$COMMAND_PATH" ]]; then
+    cp "$SCRIPT_PATH" "$COMMAND_PATH"
+  fi
   chmod +x "$COMMAND_PATH"
   log "Installed local command: $COMMAND_PATH"
 

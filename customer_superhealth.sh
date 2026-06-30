@@ -134,6 +134,7 @@ def discover_hermes():
     accounts_dir = home / ".hermes" / "weixin" / "accounts"
     accounts_index = home / ".hermes" / "weixin" / "accounts.json"
     candidates = []
+    context_token_files = []
     index = load_json(accounts_index)
     if isinstance(index, list):
         candidates.extend(str(item) for item in index)
@@ -144,6 +145,11 @@ def discover_hermes():
             reverse=True,
         )
         candidates.extend(path.stem for path in files)
+        context_token_files = sorted(
+            accounts_dir.glob("*.context-tokens.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
 
     seen = set()
     for account_id in candidates:
@@ -157,6 +163,20 @@ def discover_hermes():
         target = str(data.get("userId") or data.get("target") or "").strip()
         if account_id and target:
             return account_id, target, "hermes"
+
+    context_suffix = ".context-tokens.json"
+    for context_file in context_token_files:
+        account_id = context_file.name[:-len(context_suffix)] if context_file.name.endswith(context_suffix) else ""
+        data = load_json(context_file)
+        targets = []
+        if isinstance(data, dict):
+            targets.extend(str(key) for key in data.keys())
+        elif isinstance(data, list):
+            targets.extend(str(item) for item in data)
+        for target in targets:
+            target = target.strip()
+            if account_id and target:
+                return account_id, target, "hermes"
     return "", "", ""
 
 

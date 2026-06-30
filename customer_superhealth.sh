@@ -253,6 +253,11 @@ configure_ssh_alias() {
   log "Configuring GitHub SSH alias"
   touch "$HOME/.ssh/config"
   chmod 600 "$HOME/.ssh/config"
+  touch "$HOME/.ssh/known_hosts"
+  chmod 644 "$HOME/.ssh/known_hosts"
+  if ! ssh-keygen -F "[ssh.github.com]:443" -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1; then
+    ssh-keyscan -p 443 ssh.github.com >>"$HOME/.ssh/known_hosts" 2>/dev/null
+  fi
   if grep -q '^Host github\.com-superhealth$' "$HOME/.ssh/config"; then
     cp "$HOME/.ssh/config" "$HOME/.ssh/config.bak.$(date +%Y%m%d%H%M%S)"
     awk '

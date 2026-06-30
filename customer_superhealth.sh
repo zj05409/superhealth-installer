@@ -141,7 +141,7 @@ install_system_dependencies() {
   "${SUDO[@]}" apt-get update
 
   local packages=(
-    git curl wget ca-certificates openssh-client jq tar gzip \
+    git curl wget ca-certificates openssh-client jq tar gzip unzip \
     python3 python3-pip python3-full python3-venv \
     fonts-wqy-zenhei fonts-wqy-microhei \
     libglib2.0-0 libnss3 libnspr4 \
@@ -320,10 +320,62 @@ stop_services() {
 
 start_services() {
   cd "$CURRENT_LINK"
-  DASHBOARD_PORT="$DASHBOARD_PORT" bash scripts/manage_service.sh start dashboard
-  SUPERHEALTH_VITALS_PORT="$VITALS_PORT" bash scripts/manage_service.sh start vitals_receiver
-  bash scripts/manage_service.sh schedule daily_pipeline 7 0
-  bash scripts/manage_service.sh schedule weekly_pipeline 20 30 0
+  DASHBOARD_PORT="$DASHBOARD_PORT" SUPERHEALTH_INSTALL_PLAYWRIGHT=0 bash scripts/manage_service.sh start dashboard
+  install_playwright_chromium_fast
+  SUPERHEALTH_VITALS_PORT="$VITALS_PORT" SUPERHEALTH_INSTALL_PLAYWRIGHT=0 bash scripts/manage_service.sh start vitals_receiver
+  SUPERHEALTH_INSTALL_PLAYWRIGHT=0 bash scripts/manage_service.sh schedule daily_pipeline 7 0
+  SUPERHEALTH_INSTALL_PLAYWRIGHT=0 bash scripts/manage_service.sh schedule weekly_pipeline 20 30 0
+}
+
+install_playwright_chromium_fast() {
+  local python_bin="$CURRENT_LINK/venv/bin/python3"
+  if [[ ! -x "$python_bin" ]]; then
+    echo "Playwright browser install skipped: venv python not found yet." >&2
+    return
+  fi
+  if ! "$python_bin" -c "import playwright" >/dev/null 2>&1; then
+    echo "Playwright browser install skipped: playwright package not installed." >&2
+    return
+  fi
+
+  local info revision browser_version target_dir marker chrome_path download_url tmp_dir zip_path
+  info="$("$python_bin" - <<'PY'
+import json
+from pathlib import Path
+import playwright
+
+root = Path(playwright.__file__).resolve().parent
+data = json.loads((root / "driver" / "package" / "browsers.json").read_text())
+for browser in data["browsers"]:
+    if browser["name"] == "chromium":
+        print(browser["revision"])
+        print(browser["browserVersion"])
+        break
+else:
+    raise SystemExit("chromium descriptor not found")
+PY
+)"
+  revision="$(printf '%s\n' "$info" | sed -n '1p')"
+  browser_version="$(printf '%s\n' "$info" | sed -n '2p')"
+  target_dir="$HOME/.cache/ms-playwright/chromium-$revision"
+  marker="$target_dir/INSTALLATION_COMPLETE"
+  chrome_path="$target_dir/chrome-linux64/chrome"
+  if [[ -x "$chrome_path" && -f "$marker" ]]; then
+    log "Playwright Chromium already installed: $target_dir"
+    return
+  fi
+
+  download_url="${SUPERHEALTH_PLAYWRIGHT_CHROMIUM_URL:-https://cdn.npmmirror.com/binaries/chrome-for-testing/${browser_version}/linux64/chrome-linux64.zip}"
+  tmp_dir="$(mktemp -d)"
+  zip_path="$tmp_dir/chrome-linux64.zip"
+  log "Installing Playwright Chromium from $download_url"
+  curl -fL --retry 3 --retry-delay 2 "$download_url" -o "$zip_path"
+  rm -rf "$target_dir"
+  mkdir -p "$target_dir"
+  unzip -q "$zip_path" -d "$target_dir"
+  rm -rf "$tmp_dir"
+  chmod +x "$chrome_path"
+  touch "$target_dir/DEPENDENCIES_VALIDATED" "$marker"
 }
 
 wait_for_url() {

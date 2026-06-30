@@ -121,7 +121,16 @@ require_ubuntu() {
 
 require_sudo() {
   log "Checking sudo access"
-  sudo -v
+  if sudo -n true 2>/dev/null; then
+    return
+  fi
+  if [[ -t 0 ]]; then
+    sudo -v
+    return
+  fi
+  echo "sudo requires a password, but this installer is not running in an interactive terminal." >&2
+  echo "Run the install command directly in the server terminal, or configure passwordless sudo for this user." >&2
+  exit 1
 }
 
 install_system_dependencies() {

@@ -6,7 +6,9 @@
 http://<服务器公网 IP>:8501
 ```
 
-建议先进入「系统配置」，依次完成 Garmin、消息推送和大模型配置，然后保存并测试。
+建议先进入「系统配置」，依次完成 Garmin 和消息推送配置，然后保存并测试。
+
+DeepSeek API Key 不在 Dashboard 里填写。它应在腾讯云轻量应用服务器的 SuperHealth 应用初始/基础配置里设置。
 
 ## 1. Garmin Connect
 
@@ -26,10 +28,11 @@ DeepSeek 适合做主要健康建议和日报分析模型。
    https://platform.deepseek.com/top_up
 3. 创建 API KEY：
    https://platform.deepseek.com/api_keys
-4. 在 Dashboard 的大模型配置中填写：
-   - API Key
-   - Base URL: `https://api.deepseek.com`
-   - Model: 可先使用 `deepseek-chat`
+4. 回到腾讯云轻量应用服务器控制台：
+   https://console.cloud.tencent.com/lighthouse/instance/index
+5. 打开客户购买的 SuperHealth 服务器实例，进入「应用」相关页面，在初始配置/基础配置里填写 DeepSeek API Key。
+
+不要把 DeepSeek API Key 填到 Dashboard 的系统配置里；Dashboard 里主要配置 Garmin、消息推送，以及后续需要人工维护的用户侧配置。
 
 ## 3. 百川大模型 API
 

@@ -39,7 +39,9 @@ RELEASES_DIR="$INSTALL_ROOT/releases"
 CURRENT_LINK="$INSTALL_ROOT/current"
 PREVIOUS_VERSION_FILE="$INSTALL_ROOT/.previous_version"
 BACKUP_DIR="$DATA_DIR/backups"
+INSTALL_LOG="$DATA_DIR/install.log"
 SUDO=(sudo)
+CURRENT_STAGE=""
 
 log() {
   printf '\n[superhealth] %s\n' "$*" >&2
@@ -86,8 +88,56 @@ persist_installer_config() {
     write_config_line DASHBOARD_PORT "$DASHBOARD_PORT"
     write_config_line SUPERHEALTH_VITALS_PORT "$VITALS_PORT"
     write_config_line SUPERHEALTH_INSTALLER_URL "$INSTALLER_URL"
+    write_config_line SUPERHEALTH_ACTIVATION_TOKEN "${SUPERHEALTH_ACTIVATION_TOKEN:-}"
+    write_config_line SUPERHEALTH_MACHINE_FINGERPRINT "${SUPERHEALTH_MACHINE_FINGERPRINT:-}"
+    write_config_line SUPERHEALTH_INSTALL_EVENT_URL "${SUPERHEALTH_INSTALL_EVENT_URL:-}"
   } >"$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
+}
+
+report_install_event() {
+  local stage="$1" status="$2" error="${3:-}"
+  local event_url="${SUPERHEALTH_INSTALL_EVENT_URL:-}"
+  local fingerprint="${SUPERHEALTH_MACHINE_FINGERPRINT:-}"
+  [[ -n "$event_url" && -n "$fingerprint" ]] || return 0
+
+  local log_tail=""
+  if [[ -f "$INSTALL_LOG" ]]; then
+    log_tail="$(tail -n 80 "$INSTALL_LOG" | sed -E 's/(SUPERHEALTH_DEPLOY_KEY_B64=)[^[:space:]]+/\1[redacted]/g; s#(/key/[^ ?]+)#/key/[redacted]#g')"
+  fi
+
+  curl -fsS --connect-timeout 5 --max-time 15 \
+    --data-urlencode "machine_fingerprint=$fingerprint" \
+    --data-urlencode "stage=$stage" \
+    --data-urlencode "status=$status" \
+    --data-urlencode "error=$error" \
+    --data-urlencode "log=$log_tail" \
+    "$event_url" >/dev/null 2>&1 || true
+}
+
+run_stage() {
+  local stage="$1"
+  shift
+  CURRENT_STAGE="$stage"
+  report_install_event "$stage" "running"
+  "$@"
+  report_install_event "$stage" "ok"
+}
+
+report_install_failure() {
+  local exit_code="$?"
+  if [[ "$exit_code" != "0" && -n "$CURRENT_STAGE" ]]; then
+    report_install_event "$CURRENT_STAGE" "failed" "exit code $exit_code"
+  fi
+  exit "$exit_code"
+}
+
+start_install_logging() {
+  mkdir -p "$DATA_DIR"
+  chmod 700 "$DATA_DIR"
+  touch "$INSTALL_LOG"
+  chmod 600 "$INSTALL_LOG"
+  exec > >(tee -a "$INSTALL_LOG") 2>&1
 }
 
 install_local_command() {
@@ -638,22 +688,30 @@ validate_installation() {
 }
 
 install_flow() {
-  require_ubuntu
-  require_sudo
-  install_system_dependencies
-  enable_user_linger
-  configure_pip_mirror
-  read_deploy_key
-  configure_ssh_alias
-  install_local_command
-  sync_source_repo
+  start_install_logging
+  trap report_install_failure EXIT
+  run_stage preflight require_ubuntu
+  run_stage sudo require_sudo
+  run_stage system_dependencies install_system_dependencies
+  run_stage user_linger enable_user_linger
+  run_stage pip_mirror configure_pip_mirror
+  run_stage fetch_deploy_key read_deploy_key
+  run_stage ssh_alias configure_ssh_alias
+  run_stage local_command install_local_command
+  run_stage sync_source sync_source_repo
   local version
+  CURRENT_STAGE="build_release"
+  report_install_event "$CURRENT_STAGE" "running"
   version="$(build_release_from_source)"
-  stop_services
-  activate_release "$version"
-  configure_channel_from_local_messaging
-  start_services
-  validate_installation
+  report_install_event "$CURRENT_STAGE" "ok"
+  run_stage stop_services stop_services
+  run_stage activate_release activate_release "$version"
+  run_stage configure_channel configure_channel_from_local_messaging
+  run_stage start_services start_services
+  run_stage validate validate_installation
+  CURRENT_STAGE="completed"
+  report_install_event completed completed
+  trap - EXIT
   log "Installed version: $version"
 }
 

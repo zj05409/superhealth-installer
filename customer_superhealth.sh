@@ -575,44 +575,94 @@ install_playwright_chromium_fast() {
     return
   fi
 
-  local info revision browser_version target_dir marker chrome_path download_url tmp_dir zip_path
-  info="$("$python_bin" - <<'PY'
+  playwright_chromium_usable "$python_bin" && {
+    log "Playwright Chromium is already usable"
+    return
+  }
+
+  if ! install_playwright_chromium_from_npmmirror "$python_bin"; then
+    log "Fast Chromium install failed; falling back to Playwright installer"
+    "$python_bin" -m playwright install chromium
+  fi
+
+  playwright_chromium_usable "$python_bin"
+}
+
+playwright_chromium_usable() {
+  local python_bin="$1"
+  "$python_bin" - <<'PY' >/dev/null 2>&1
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    browser.close()
+PY
+}
+
+install_playwright_chromium_from_npmmirror() {
+  local python_bin="$1"
+  local browser_lines name revision browser_version target_dir marker executable archive_name archive_dir download_url tmp_dir zip_path
+  browser_lines="$("$python_bin" - <<'PY'
 import json
 from pathlib import Path
 import playwright
 
 root = Path(playwright.__file__).resolve().parent
 data = json.loads((root / "driver" / "package" / "browsers.json").read_text())
+wanted = {"chromium", "chromium-headless-shell"}
 for browser in data["browsers"]:
-    if browser["name"] == "chromium":
-        print(browser["revision"])
-        print(browser["browserVersion"])
-        break
-else:
-    raise SystemExit("chromium descriptor not found")
+    if browser["name"] in wanted:
+        print(f"{browser['name']}\t{browser['revision']}\t{browser['browserVersion']}")
 PY
 )"
-  revision="$(printf '%s\n' "$info" | sed -n '1p')"
-  browser_version="$(printf '%s\n' "$info" | sed -n '2p')"
-  target_dir="$HOME/.cache/ms-playwright/chromium-$revision"
-  marker="$target_dir/INSTALLATION_COMPLETE"
-  chrome_path="$target_dir/chrome-linux64/chrome"
-  if [[ -x "$chrome_path" && -f "$marker" ]]; then
-    log "Playwright Chromium already installed: $target_dir"
-    return
+
+  if [[ -z "$browser_lines" ]]; then
+    echo "Could not find Chromium descriptors in Playwright browsers.json" >&2
+    return 1
   fi
 
-  download_url="${SUPERHEALTH_PLAYWRIGHT_CHROMIUM_URL:-https://cdn.npmmirror.com/binaries/chrome-for-testing/${browser_version}/linux64/chrome-linux64.zip}"
-  tmp_dir="$(mktemp -d)"
-  zip_path="$tmp_dir/chrome-linux64.zip"
-  log "Installing Playwright Chromium from $download_url"
-  curl -fL --retry 3 --retry-delay 2 "$download_url" -o "$zip_path"
-  rm -rf "$target_dir"
-  mkdir -p "$target_dir"
-  unzip -q "$zip_path" -d "$target_dir"
-  rm -rf "$tmp_dir"
-  chmod +x "$chrome_path"
-  touch "$target_dir/DEPENDENCIES_VALIDATED" "$marker"
+  while IFS=$'\t' read -r name revision browser_version; do
+    [[ -n "$name" && -n "$revision" && -n "$browser_version" ]] || continue
+    case "$name" in
+      chromium)
+        target_dir="$HOME/.cache/ms-playwright/chromium-$revision"
+        archive_name="chrome-linux64.zip"
+        archive_dir="chrome-linux64"
+        executable="$target_dir/$archive_dir/chrome"
+        download_url="${SUPERHEALTH_PLAYWRIGHT_CHROMIUM_URL:-https://cdn.npmmirror.com/binaries/chrome-for-testing/${browser_version}/linux64/${archive_name}}"
+        ;;
+      chromium-headless-shell)
+        target_dir="$HOME/.cache/ms-playwright/chromium_headless_shell-$revision"
+        archive_name="chrome-headless-shell-linux64.zip"
+        archive_dir="chrome-headless-shell-linux64"
+        executable="$target_dir/$archive_dir/chrome-headless-shell"
+        download_url="${SUPERHEALTH_PLAYWRIGHT_HEADLESS_SHELL_URL:-https://cdn.npmmirror.com/binaries/chrome-for-testing/${browser_version}/linux64/${archive_name}}"
+        ;;
+      *)
+        continue
+        ;;
+    esac
+
+    marker="$target_dir/INSTALLATION_COMPLETE"
+    if [[ -x "$executable" && -f "$marker" ]]; then
+      log "Playwright $name already installed: $target_dir"
+      continue
+    fi
+
+    tmp_dir="$(mktemp -d)"
+    zip_path="$tmp_dir/$archive_name"
+    log "Installing Playwright $name from $download_url"
+    if ! curl -fL --retry 3 --retry-delay 2 "$download_url" -o "$zip_path"; then
+      rm -rf "$tmp_dir"
+      return 1
+    fi
+    rm -rf "$target_dir"
+    mkdir -p "$target_dir"
+    unzip -q "$zip_path" -d "$target_dir"
+    rm -rf "$tmp_dir"
+    chmod +x "$executable"
+    touch "$target_dir/DEPENDENCIES_VALIDATED" "$marker"
+  done <<<"$browser_lines"
 }
 
 wait_for_url() {
@@ -674,6 +724,7 @@ validate_installation() {
 
   cd "$CURRENT_LINK"
   venv/bin/python3 -c "import superhealth.dashboard.app, superhealth.api.vitals_receiver, superhealth.daily_pipeline, superhealth.weekly_pipeline"
+  playwright_chromium_usable "$CURRENT_LINK/venv/bin/python3"
   bash scripts/manage_service.sh status dashboard
   bash scripts/manage_service.sh status vitals_receiver
   bash scripts/manage_service.sh status daily_pipeline

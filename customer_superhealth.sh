@@ -33,6 +33,7 @@ INSTALLER_URL="${SUPERHEALTH_INSTALLER_URL:-}"
 COMMAND_PATH="${SUPERHEALTH_COMMAND_PATH:-$HOME/.local/bin/superhealth}"
 SCRIPT_PATH="${SUPERHEALTH_SCRIPT_PATH:-${BASH_SOURCE[0]}}"
 CONFIG_FILE="${SUPERHEALTH_INSTALLER_CONFIG:-$DATA_DIR/installer.env}"
+DASHBOARD_SETUP_GUIDE_URL="${SUPERHEALTH_DASHBOARD_SETUP_GUIDE_URL:-https://cdn.jsdelivr.net/gh/zj05409/superhealth-installer@main/dashboard-setup.md}"
 
 SOURCE_DIR="$INSTALL_ROOT/source"
 RELEASES_DIR="$INSTALL_ROOT/releases"
@@ -764,6 +765,11 @@ install_flow() {
   report_install_event completed completed
   trap - EXIT
   log "Installed version: $version"
+  log "DeepSeek top up: https://platform.deepseek.com/top_up"
+  log "DeepSeek API keys: https://platform.deepseek.com/api_keys"
+  log "Baichuan top up: https://platform.baichuan-ai.com/console/recharge"
+  log "Baichuan API keys: https://platform.baichuan-ai.com/console/apikey"
+  log "Dashboard setup guide: $DASHBOARD_SETUP_GUIDE_URL"
 }
 
 upgrade_flow() {

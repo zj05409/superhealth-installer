@@ -739,6 +739,57 @@ validate_installation() {
   log "Validation passed"
 }
 
+install_telemetry_timer() {
+  log "Installing telemetry reporter"
+  local script_src
+  script_src="${BASH_SOURCE[0]%/*}/telemetry_report.sh"
+  if [[ ! -f "$script_src" ]]; then
+    script_src="$(dirname "${SCRIPT_PATH:-$0}")/telemetry_report.sh"
+  fi
+  if [[ ! -f "$script_src" ]]; then
+    echo "telemetry_report.sh not found, skipping telemetry timer" >&2
+    return 0
+  fi
+
+  mkdir -p "$HOME/.local/bin"
+  cp "$script_src" "$HOME/.local/bin/telemetry_report.sh"
+  chmod +x "$HOME/.local/bin/telemetry_report.sh"
+
+  mkdir -p "$HOME/.config/systemd/user"
+  cat > "$HOME/.config/systemd/user/superhealth-telemetry.service" <<UNIT
+[Unit]
+Description=SuperHealth telemetry reporter
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$HOME/.local/bin/telemetry_report.sh
+WorkingDirectory=$HOME
+StandardOutput=append:$DATA_DIR/logs/telemetry.log
+StandardError=append:$DATA_DIR/logs/telemetry.log
+
+[Install]
+WantedBy=default.target
+UNIT
+
+  cat > "$HOME/.config/systemd/user/superhealth-telemetry.timer" <<UNIT
+[Unit]
+Description=Run SuperHealth telemetry reporter daily
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now superhealth-telemetry.timer
+  log "Telemetry timer installed (daily at 08:00)"
+}
+
 install_flow() {
   start_install_logging
   trap report_install_failure EXIT
@@ -750,6 +801,7 @@ install_flow() {
   run_stage fetch_deploy_key read_deploy_key
   run_stage ssh_alias configure_ssh_alias
   run_stage local_command install_local_command
+  run_stage telemetry_timer install_telemetry_timer
   run_stage sync_source sync_source_repo
   local version
   CURRENT_STAGE="build_release"
@@ -781,6 +833,7 @@ upgrade_flow() {
   read_deploy_key
   configure_ssh_alias
   install_local_command
+  install_telemetry_timer
 
   local previous backup version
   previous="$(current_version)"

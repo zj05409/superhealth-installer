@@ -161,6 +161,10 @@ install_local_command() {
 }
 
 configure_channel_from_local_messaging() {
+  if [[ -f "$DATA_DIR/users.toml" ]]; then
+    log "Multi-user channel bindings are managed per user; skipping legacy global channel auto-config"
+    return
+  fi
   if [[ "${SUPERHEALTH_DISABLE_CHANNEL_AUTOCONFIG:-0}" == "1" ]]; then
     return
   fi
@@ -343,6 +347,32 @@ if not account_id:
 else:
     upsert_channel(account_id, target, source)
 PY
+}
+
+provision_multiuser_openclaw() {
+  log "Provisioning admin-only multi-user mode and the session-bound OpenClaw plugin"
+  command -v openclaw >/dev/null 2>&1 || {
+    echo "OpenClaw is required. Configure WeCom and send one administrator message before installing SuperHealth." >&2
+    return 1
+  }
+  openclaw config set channels.wecom.dmPolicy open
+  openclaw config set channels.wecom.allowFrom '["*"]'
+
+  if [[ ! -x "$CURRENT_LINK/venv/bin/python3" ]]; then
+    python3 -m venv "$CURRENT_LINK/venv"
+  fi
+  "$CURRENT_LINK/venv/bin/python3" -m pip install -U pip
+  "$CURRENT_LINK/venv/bin/python3" -m pip install -e "$CURRENT_LINK"
+  "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/bootstrap_multiuser.py"
+
+  openclaw plugins install --force --link "$CURRENT_LINK/openclaw-plugin"
+  openclaw plugins enable superhealth
+  if [[ -f "$HOME/.openclaw/plugin-skills/superhealth-nutrition/SKILL.md" ]]; then
+    chmod 600 "$HOME/.openclaw/plugin-skills/superhealth-nutrition/SKILL.md"
+    mv "$HOME/.openclaw/plugin-skills/superhealth-nutrition/SKILL.md" \
+      "$HOME/.openclaw/plugin-skills/superhealth-nutrition/SKILL.md.disabled"
+  fi
+  openclaw gateway restart --force
 }
 
 require_ubuntu() {
@@ -810,6 +840,7 @@ install_flow() {
   report_install_event "$CURRENT_STAGE" "ok"
   run_stage stop_services stop_services
   run_stage activate_release activate_release "$version"
+  run_stage provision_multiuser provision_multiuser_openclaw
   run_stage configure_channel configure_channel_from_local_messaging
   run_stage start_services start_services
   run_stage validate validate_installation
@@ -846,6 +877,7 @@ upgrade_flow() {
   if ! (
     stop_services
     activate_release "$version"
+    provision_multiuser_openclaw
     configure_channel_from_local_messaging
     start_services
     validate_installation

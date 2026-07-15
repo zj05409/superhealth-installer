@@ -350,6 +350,18 @@ PY
 }
 
 provision_multiuser_openclaw() {
+  local install_mode="${1:-install}"
+
+  # Updating an existing main-branch installation must not silently convert its
+  # global config/database into the new per-user layout. Multi-user migration is
+  # deliberately opt-in; fresh installs and already-migrated installs continue
+  # through the provisioning path below.
+  if [[ "$install_mode" == "upgrade" && ! -f "$DATA_DIR/users.toml" ]]; then
+    log "Legacy single-user installation detected; preserving config and database"
+    log "Skipping multi-user/OpenClaw provisioning during this upgrade"
+    return 0
+  fi
+
   log "Provisioning admin-only multi-user mode and the session-bound OpenClaw plugin"
   command -v openclaw >/dev/null 2>&1 || {
     echo "OpenClaw is required. Configure WeCom and send one administrator message before installing SuperHealth." >&2
@@ -840,7 +852,7 @@ install_flow() {
   report_install_event "$CURRENT_STAGE" "ok"
   run_stage stop_services stop_services
   run_stage activate_release activate_release "$version"
-  run_stage provision_multiuser provision_multiuser_openclaw
+  run_stage provision_multiuser provision_multiuser_openclaw install
   run_stage configure_channel configure_channel_from_local_messaging
   run_stage start_services start_services
   run_stage validate validate_installation
@@ -877,7 +889,7 @@ upgrade_flow() {
   if ! (
     stop_services
     activate_release "$version"
-    provision_multiuser_openclaw
+    provision_multiuser_openclaw upgrade
     configure_channel_from_local_messaging
     start_services
     validate_installation

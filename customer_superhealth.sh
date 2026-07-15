@@ -49,6 +49,22 @@ log() {
   printf '\n[superhealth] %s\n' "$*" >&2
 }
 
+add_user_tool_paths() {
+  # systemd user services do not inherit an interactive shell's nvm/pnpm PATH.
+  # Discover standard per-user locations so an existing OpenClaw install works
+  # during unattended installation as well as from an SSH terminal.
+  local dir
+  for dir in \
+    "$HOME/.local/bin" \
+    "$HOME/.local/share/pnpm" \
+    "$HOME/.npm-global/bin" \
+    "$HOME/.nvm/current/bin" \
+    "$HOME"/.nvm/versions/node/*/bin; do
+    [[ -d "$dir" ]] && PATH="$dir:$PATH"
+  done
+  export PATH
+}
+
 usage() {
   cat <<EOF
 Usage: bash customer_superhealth.sh <command> [options]
@@ -376,7 +392,8 @@ provision_multiuser_openclaw() {
     return 0
   fi
 
-  log "Provisioning admin-only multi-user mode and the session-bound OpenClaw plugin"
+  log "Provisioning admin-only multi-user mode and the agent-bound OpenClaw plugin"
+  add_user_tool_paths
   command -v openclaw >/dev/null 2>&1 || {
     echo "OpenClaw is required. Configure WeCom and send one administrator message before installing SuperHealth." >&2
     return 1

@@ -31,9 +31,17 @@ main() {
     return 0
   fi
 
-  # Source only the keys we need (safe: file is owned by the user)
+  # Source only the keys we need. A real temporary file is used instead of
+  # process substitution because Bash 3.2 may return from ``source`` before
+  # the producer has populated /dev/fd, leaving all values empty.
+  local telemetry_env
+  telemetry_env=$(mktemp "${TMPDIR:-/tmp}/superhealth-telemetry.XXXXXX") || return 0
+  chmod 600 "$telemetry_env" 2>/dev/null || true
+  grep -E '^(SUPERHEALTH_ACTIVATION_TOKEN|SUPERHEALTH_INSTALL_EVENT_URL|SUPERHEALTH_MACHINE_FINGERPRINT)=' \
+    "$INSTALLER_ENV" >"$telemetry_env" 2>/dev/null || true
   # shellcheck disable=SC1090
-  source <(grep -E '^(SUPERHEALTH_ACTIVATION_TOKEN|SUPERHEALTH_INSTALL_EVENT_URL|SUPERHEALTH_MACHINE_FINGERPRINT)=' "$INSTALLER_ENV" 2>/dev/null) || true
+  source "$telemetry_env" || true
+  rm -f "$telemetry_env"
 
   local ACTIVATION_TOKEN="${SUPERHEALTH_ACTIVATION_TOKEN:-}"
   local INSTALL_EVENT_URL="${SUPERHEALTH_INSTALL_EVENT_URL:-}"
@@ -59,7 +67,13 @@ main() {
   # 2. Find the health database
   ##############################################################################
   local HEALTH_DB=""
-  if [[ -f "${HOME}/superHealth/data/health.db" ]]; then
+  HEALTH_DB=$(find "${HOME}/.superhealth/users" -mindepth 2 -maxdepth 2 \
+    -name health.db -type f ! -path '*/admin/*' 2>/dev/null | sort | head -1 || true)
+  if [[ -n "$HEALTH_DB" ]]; then
+    :
+  elif [[ -f "${HOME}/.superhealth/users/admin/health.db" ]]; then
+    HEALTH_DB="${HOME}/.superhealth/users/admin/health.db"
+  elif [[ -f "${HOME}/superHealth/data/health.db" ]]; then
     HEALTH_DB="${HOME}/superHealth/data/health.db"
   else
     HEALTH_DB=$(find "${HOME}/superHealth" -name "health.db" -type f 2>/dev/null | head -1 || true)
@@ -127,16 +141,20 @@ main() {
   fi
 
   # --- Push channel configured (boolean only — never send actual values) ---
-  local config_toml="${HOME}/.superhealth/config.toml"
   local push_channel_configured="false"
-  if [[ -f "$config_toml" ]]; then
+  local config_toml
+  for config_toml in \
+    "${HOME}/.superhealth/config.toml" \
+    "${HOME}"/.superhealth/users/*/config.toml; do
+    [[ -f "$config_toml" ]] || continue
     local has_account_id has_target
     has_account_id=$(grep -E '^\s*account_id\s*=\s*"[^"]+"' "$config_toml" 2>/dev/null || true)
     has_target=$(grep -E '^\s*target\s*=\s*"[^"]+"' "$config_toml" 2>/dev/null || true)
     if [[ -n "$has_account_id" && -n "$has_target" ]]; then
       push_channel_configured="true"
+      break
     fi
-  fi
+  done
 
   # --- Goals (aggregate counts only — no raw goal data) ---
   local goals_active goals_achieved goals_adherence
@@ -312,6 +330,8 @@ EOJSON
   log "telemetry_report completed"
 }
 
+# Create the redirection target before the shell opens it for ``main``.
+mkdir -p "$LOG_DIR" 2>/dev/null || true
 # Run main; on ANY error, log and exit 0 so the customer system is never disrupted.
 main "$@" 2>>"${LOG_FILE:-/dev/null}" || {
   log "telemetry_report encountered an error — exiting silently"

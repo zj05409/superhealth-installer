@@ -421,11 +421,10 @@ provision_multiuser_openclaw() {
   fi
   "$CURRENT_LINK/venv/bin/python3" -m pip install -U pip
   "$CURRENT_LINK/venv/bin/python3" -m pip install -e "$CURRENT_LINK"
-  if [[ ! -f "$DATA_DIR/users.toml" ]]; then
-    "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/bootstrap_multiuser.py"
-  else
+  if [[ -f "$DATA_DIR/users.toml" ]]; then
     log "Existing multi-user registry detected; keeping all users unchanged"
   fi
+  "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/bootstrap_multiuser.py"
 
   # OpenClaw 2026.6+ rejects --force together with --link. Remove only the
   # persisted registration first, then recreate the link to the active release.

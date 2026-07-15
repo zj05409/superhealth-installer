@@ -24,6 +24,7 @@ fi
 
 REPO_SSH_URL="${SUPERHEALTH_REPO_SSH_URL:-git@github.com-superhealth:chasezjj/superHealth.git}"
 BRANCH="${SUPERHEALTH_BRANCH:-main}"
+DEPLOYMENT_MODE="${SUPERHEALTH_DEPLOYMENT_MODE:-single}"
 INSTALL_ROOT="${SUPERHEALTH_INSTALL_ROOT:-$HOME/superHealth}"
 DATA_DIR="${SUPERHEALTH_DATA_DIR:-$HOME/.superhealth}"
 DEPLOY_KEY_PATH="${SUPERHEALTH_DEPLOY_KEY_PATH:-$HOME/.ssh/superhealth-deploy}"
@@ -50,7 +51,7 @@ log() {
 
 usage() {
   cat <<EOF
-Usage: bash customer_superhealth.sh <command>
+Usage: bash customer_superhealth.sh <command> [options]
 
 Commands:
   install       First install: system packages, deploy key, clone, start services, validate.
@@ -59,9 +60,15 @@ Commands:
   backup        Create a local backup of SuperHealth data/config.
   status        Show release and service status.
   validate      Verify layout, Python imports, services, and HTTP health endpoints.
+  migrate-multiuser  Explicitly migrate a legacy single-user deployment.
+
+Options for install/upgrade:
+  --branch NAME        Git branch to install or upgrade to.
+  --mode single|multi  Deployment mode. Existing installs default to their saved mode.
 
 Environment:
   SUPERHEALTH_BRANCH             Git branch to deploy. Default: $BRANCH
+  SUPERHEALTH_DEPLOYMENT_MODE    single or multi. Default: $DEPLOYMENT_MODE
   SUPERHEALTH_REPO_SSH_URL       Repo SSH URL. Default: $REPO_SSH_URL
   SUPERHEALTH_INSTALL_ROOT       Install root. Default: $INSTALL_ROOT
   SUPERHEALTH_DATA_DIR           Data/config dir. Default: $DATA_DIR
@@ -83,6 +90,7 @@ persist_installer_config() {
   {
     write_config_line SUPERHEALTH_REPO_SSH_URL "$REPO_SSH_URL"
     write_config_line SUPERHEALTH_BRANCH "$BRANCH"
+    write_config_line SUPERHEALTH_DEPLOYMENT_MODE "$DEPLOYMENT_MODE"
     write_config_line SUPERHEALTH_INSTALL_ROOT "$INSTALL_ROOT"
     write_config_line SUPERHEALTH_DATA_DIR "$DATA_DIR"
     write_config_line SUPERHEALTH_DEPLOY_KEY_PATH "$DEPLOY_KEY_PATH"
@@ -352,13 +360,19 @@ PY
 provision_multiuser_openclaw() {
   local install_mode="${1:-install}"
 
+  if [[ "$DEPLOYMENT_MODE" == "single" ]]; then
+    log "Single-user mode selected; skipping multi-user/OpenClaw provisioning"
+    return 0
+  fi
+
   # Updating an existing main-branch installation must not silently convert its
   # global config/database into the new per-user layout. Multi-user migration is
   # deliberately opt-in; fresh installs and already-migrated installs continue
   # through the provisioning path below.
   if [[ "$install_mode" == "upgrade" && ! -f "$DATA_DIR/users.toml" ]]; then
     log "Legacy single-user installation detected; preserving config and database"
-    log "Skipping multi-user/OpenClaw provisioning during this upgrade"
+    log "Skipping automatic migration during this upgrade"
+    log "Run: superhealth migrate-multiuser [migration options]"
     return 0
   fi
 
@@ -375,7 +389,11 @@ provision_multiuser_openclaw() {
   fi
   "$CURRENT_LINK/venv/bin/python3" -m pip install -U pip
   "$CURRENT_LINK/venv/bin/python3" -m pip install -e "$CURRENT_LINK"
-  "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/bootstrap_multiuser.py"
+  if [[ ! -f "$DATA_DIR/users.toml" ]]; then
+    "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/bootstrap_multiuser.py"
+  else
+    log "Existing multi-user registry detected; keeping all users unchanged"
+  fi
 
   openclaw plugins install --force --link "$CURRENT_LINK/openclaw-plugin"
   openclaw plugins enable superhealth
@@ -908,6 +926,41 @@ upgrade_flow() {
   log "Backup created before upgrade: $backup"
 }
 
+migrate_multiuser_flow() {
+  local skip_openclaw=0 arg
+  if [[ "$DEPLOYMENT_MODE" == "multi" && -f "$DATA_DIR/users.toml" ]]; then
+    log "Deployment is already in multi-user mode"
+    return 0
+  fi
+  if [[ ! -x "$CURRENT_LINK/venv/bin/python3" ]]; then
+    echo "SuperHealth is not installed; install or upgrade before migration." >&2
+    return 1
+  fi
+
+  backup_data >/dev/null
+  stop_services
+  if ! "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/migrate_to_multiuser.py" "$@"; then
+    start_services || true
+    return 1
+  fi
+  DEPLOYMENT_MODE="multi"
+  persist_installer_config
+  for arg in "$@"; do
+    [[ "$arg" == "--skip-openclaw" ]] && skip_openclaw=1
+  done
+  if [[ "$skip_openclaw" == "0" ]]; then
+    if ! provision_multiuser_openclaw upgrade; then
+      start_services || true
+      return 1
+    fi
+  else
+    log "OpenClaw provisioning skipped for this migration test"
+  fi
+  start_services
+  validate_installation
+  log "Migration completed; deployment mode is now multi"
+}
+
 rollback_flow() {
   local target="${1:-}"
   if [[ -z "$target" && -f "$PREVIOUS_VERSION_FILE" ]]; then
@@ -944,6 +997,8 @@ rollback_flow() {
 status_flow() {
   echo "install_root=$INSTALL_ROOT"
   echo "data_dir=$DATA_DIR"
+  echo "branch=$BRANCH"
+  echo "deployment_mode=$DEPLOYMENT_MODE"
   echo "current=$(current_version)"
   echo "releases:"
   ls -1 "$RELEASES_DIR" 2>/dev/null || true
@@ -958,13 +1013,51 @@ status_flow() {
 command="${1:-}"
 shift || true
 
+remaining_args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --branch)
+      [[ $# -ge 2 ]] || { echo "--branch requires a value" >&2; exit 2; }
+      BRANCH="$2"
+      shift 2
+      ;;
+    --branch=*)
+      BRANCH="${1#*=}"
+      shift
+      ;;
+    --mode)
+      [[ $# -ge 2 ]] || { echo "--mode requires single or multi" >&2; exit 2; }
+      DEPLOYMENT_MODE="$2"
+      shift 2
+      ;;
+    --mode=*)
+      DEPLOYMENT_MODE="${1#*=}"
+      shift
+      ;;
+    *)
+      remaining_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ || "$BRANCH" == -* || "$BRANCH" == *..* ]]; then
+  echo "Invalid Git branch: $BRANCH" >&2
+  exit 2
+fi
+if [[ "$DEPLOYMENT_MODE" != "single" && "$DEPLOYMENT_MODE" != "multi" ]]; then
+  echo "Invalid deployment mode: $DEPLOYMENT_MODE (expected single or multi)" >&2
+  exit 2
+fi
+
 case "$command" in
   install) install_flow ;;
   upgrade) upgrade_flow ;;
-  rollback) rollback_flow "${1:-}" ;;
+  rollback) rollback_flow "${remaining_args[0]:-}" ;;
   backup) backup_data ;;
   status) status_flow ;;
   validate) validate_installation ;;
+  migrate-multiuser) migrate_multiuser_flow "${remaining_args[@]}" ;;
   -h|--help|"") usage ;;
   *)
     echo "Unknown command: $command" >&2

@@ -65,6 +65,20 @@ add_user_tool_paths() {
   export PATH
 }
 
+validate_runtime_prerequisites() {
+  add_user_tool_paths
+  if [[ "$DEPLOYMENT_MODE" == "multi" ]]; then
+    command -v openclaw >/dev/null 2>&1 || {
+      echo "OpenClaw is required for multi-user mode. Complete the administrator's OpenClaw binding first." >&2
+      return 1
+    }
+    command -v node >/dev/null 2>&1 || {
+      echo "Node.js is required to run OpenClaw, but it was not found in the unattended installer PATH." >&2
+      return 1
+    }
+  fi
+}
+
 usage() {
   cat <<EOF
 Usage: bash customer_superhealth.sh <command> [options]
@@ -163,6 +177,7 @@ start_install_logging() {
   touch "$INSTALL_LOG"
   chmod 600 "$INSTALL_LOG"
   exec > >(tee -a "$INSTALL_LOG") 2>&1
+  printf '\n[superhealth] ===== automatic install attempt %s =====\n' "$(date -Iseconds)"
 }
 
 install_local_command() {
@@ -456,7 +471,7 @@ install_system_dependencies() {
   "${SUDO[@]}" apt-get update
 
   local packages=(
-    git curl wget ca-certificates openssh-client jq tar gzip unzip \
+    git curl wget ca-certificates openssh-client jq sqlite3 tar gzip unzip \
     python3 python3-pip python3-full python3-venv \
     fonts-wqy-zenhei fonts-wqy-microhei \
     libglib2.0-0 libnss3 libnspr4 \
@@ -802,6 +817,27 @@ validate_installation() {
 
   cd "$CURRENT_LINK"
   venv/bin/python3 -c "import superhealth.dashboard.app, superhealth.api.vitals_receiver, superhealth.daily_pipeline, superhealth.weekly_pipeline"
+  if [[ "$DEPLOYMENT_MODE" == "multi" ]]; then
+    test -f "$DATA_DIR/users.toml"
+    [[ "$(stat -c '%a' "$DATA_DIR/users.toml")" == "600" ]]
+    venv/bin/python3 - <<'PY'
+from superhealth.user_context import UserRegistry
+
+users = UserRegistry.load_registry()
+admins = [user for user in users.values() if user.is_admin]
+assert len(admins) == 1, f"expected exactly one administrator, found {len(admins)}"
+agent_ids = [user.openclaw_agent_id for user in users.values() if user.openclaw_agent_id]
+assert len(agent_ids) == len(set(agent_ids)), "an OpenClaw agent is bound to multiple users"
+PY
+    if [[ "${SUPERHEALTH_SKIP_OPENCLAW_VALIDATION:-0}" != "1" ]]; then
+      venv/bin/python3 -c "from superhealth.user_context import UserRegistry; assert next(user for user in UserRegistry.list_users() if user.is_admin).openclaw_agent_id"
+      add_user_tool_paths
+      systemctl --user is-active openclaw-gateway.service >/dev/null
+      openclaw plugins inspect superhealth --runtime --json | grep -q 'superhealth_chat'
+    fi
+  else
+    test ! -e "$DATA_DIR/users.toml"
+  fi
   playwright_chromium_usable "$CURRENT_LINK/venv/bin/python3"
   bash scripts/manage_service.sh status dashboard
   bash scripts/manage_service.sh status vitals_receiver
@@ -824,11 +860,11 @@ install_telemetry_timer() {
     script_src="$(dirname "${SCRIPT_PATH:-$0}")/telemetry_report.sh"
   fi
   if [[ ! -f "$script_src" ]]; then
-    echo "telemetry_report.sh not found, skipping telemetry timer" >&2
-    return 0
+    echo "telemetry_report.sh not found" >&2
+    return 1
   fi
 
-  mkdir -p "$HOME/.local/bin"
+  mkdir -p "$HOME/.local/bin" "$DATA_DIR/logs"
   cp "$script_src" "$HOME/.local/bin/telemetry_report.sh"
   chmod +x "$HOME/.local/bin/telemetry_report.sh"
 
@@ -871,6 +907,7 @@ install_flow() {
   start_install_logging
   trap report_install_failure EXIT
   run_stage preflight require_ubuntu
+  run_stage runtime_preflight validate_runtime_prerequisites
   run_stage sudo require_sudo
   run_stage system_dependencies install_system_dependencies
   run_stage user_linger enable_user_linger
@@ -974,7 +1011,11 @@ migrate_multiuser_flow() {
     log "OpenClaw provisioning skipped for this migration test"
   fi
   start_services
-  validate_installation
+  if [[ "$skip_openclaw" == "1" ]]; then
+    SUPERHEALTH_SKIP_OPENCLAW_VALIDATION=1 validate_installation
+  else
+    validate_installation
+  fi
   log "Migration completed; deployment mode is now multi"
 }
 

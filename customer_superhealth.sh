@@ -869,9 +869,12 @@ install_telemetry_timer() {
     return 1
   fi
 
+  local script_dest="$HOME/.local/bin/telemetry_report.sh"
   mkdir -p "$HOME/.local/bin" "$DATA_DIR/logs"
-  cp "$script_src" "$HOME/.local/bin/telemetry_report.sh"
-  chmod +x "$HOME/.local/bin/telemetry_report.sh"
+  if [[ ! "$script_src" -ef "$script_dest" ]]; then
+    cp "$script_src" "$script_dest"
+  fi
+  chmod +x "$script_dest"
 
   mkdir -p "$HOME/.config/systemd/user"
   cat > "$HOME/.config/systemd/user/superhealth-telemetry.service" <<UNIT

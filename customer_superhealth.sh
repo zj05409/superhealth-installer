@@ -427,7 +427,12 @@ provision_multiuser_openclaw() {
     log "Existing multi-user registry detected; keeping all users unchanged"
   fi
 
-  openclaw plugins install --force --link "$CURRENT_LINK/openclaw-plugin"
+  # OpenClaw 2026.6+ rejects --force together with --link. Remove only the
+  # persisted registration first, then recreate the link to the active release.
+  if openclaw plugins inspect superhealth --json >/dev/null 2>&1; then
+    openclaw plugins uninstall --force --keep-files superhealth
+  fi
+  openclaw plugins install --link "$CURRENT_LINK/openclaw-plugin"
   openclaw plugins enable superhealth
   if [[ -f "$HOME/.openclaw/plugin-skills/superhealth-nutrition/SKILL.md" ]]; then
     chmod 600 "$HOME/.openclaw/plugin-skills/superhealth-nutrition/SKILL.md"

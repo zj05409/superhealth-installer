@@ -24,6 +24,7 @@ fi
 
 REPO_SSH_URL="${SUPERHEALTH_REPO_SSH_URL:-git@github.com-superhealth:chasezjj/superHealth.git}"
 BRANCH="${SUPERHEALTH_BRANCH:-main}"
+DEPLOYMENT_MODE="${SUPERHEALTH_DEPLOYMENT_MODE:-multi}"
 INSTALL_ROOT="${SUPERHEALTH_INSTALL_ROOT:-$HOME/superHealth}"
 DATA_DIR="${SUPERHEALTH_DATA_DIR:-$HOME/.superhealth}"
 DEPLOY_KEY_PATH="${SUPERHEALTH_DEPLOY_KEY_PATH:-$HOME/.ssh/superhealth-deploy}"
@@ -48,9 +49,39 @@ log() {
   printf '\n[superhealth] %s\n' "$*" >&2
 }
 
+add_user_tool_paths() {
+  # systemd user services do not inherit an interactive shell's nvm/pnpm PATH.
+  # Discover standard per-user locations so an existing OpenClaw install works
+  # during unattended installation as well as from an SSH terminal.
+  local dir
+  for dir in \
+    "$HOME/.local/bin" \
+    "$HOME/.local/share/pnpm" \
+    "$HOME/.npm-global/bin" \
+    "$HOME/.nvm/current/bin" \
+    "$HOME"/.nvm/versions/node/*/bin; do
+    [[ -d "$dir" ]] && PATH="$dir:$PATH"
+  done
+  export PATH
+}
+
+validate_runtime_prerequisites() {
+  add_user_tool_paths
+  if [[ "$DEPLOYMENT_MODE" == "multi" ]]; then
+    command -v openclaw >/dev/null 2>&1 || {
+      echo "OpenClaw is required for multi-user mode. Complete the administrator's OpenClaw binding first." >&2
+      return 1
+    }
+    command -v node >/dev/null 2>&1 || {
+      echo "Node.js is required to run OpenClaw, but it was not found in the unattended installer PATH." >&2
+      return 1
+    }
+  fi
+}
+
 usage() {
   cat <<EOF
-Usage: bash customer_superhealth.sh <command>
+Usage: bash customer_superhealth.sh <command> [options]
 
 Commands:
   install       First install: system packages, deploy key, clone, start services, validate.
@@ -59,9 +90,15 @@ Commands:
   backup        Create a local backup of SuperHealth data/config.
   status        Show release and service status.
   validate      Verify layout, Python imports, services, and HTTP health endpoints.
+  migrate-multiuser  Explicitly migrate a legacy single-user deployment.
+
+Options for install/upgrade:
+  --branch NAME        Git branch to install or upgrade to.
+  --mode single|multi  Deployment mode. Existing installs default to their saved mode.
 
 Environment:
   SUPERHEALTH_BRANCH             Git branch to deploy. Default: $BRANCH
+  SUPERHEALTH_DEPLOYMENT_MODE    single or multi. Default: $DEPLOYMENT_MODE
   SUPERHEALTH_REPO_SSH_URL       Repo SSH URL. Default: $REPO_SSH_URL
   SUPERHEALTH_INSTALL_ROOT       Install root. Default: $INSTALL_ROOT
   SUPERHEALTH_DATA_DIR           Data/config dir. Default: $DATA_DIR
@@ -83,6 +120,7 @@ persist_installer_config() {
   {
     write_config_line SUPERHEALTH_REPO_SSH_URL "$REPO_SSH_URL"
     write_config_line SUPERHEALTH_BRANCH "$BRANCH"
+    write_config_line SUPERHEALTH_DEPLOYMENT_MODE "$DEPLOYMENT_MODE"
     write_config_line SUPERHEALTH_INSTALL_ROOT "$INSTALL_ROOT"
     write_config_line SUPERHEALTH_DATA_DIR "$DATA_DIR"
     write_config_line SUPERHEALTH_DEPLOY_KEY_PATH "$DEPLOY_KEY_PATH"
@@ -139,6 +177,7 @@ start_install_logging() {
   touch "$INSTALL_LOG"
   chmod 600 "$INSTALL_LOG"
   exec > >(tee -a "$INSTALL_LOG") 2>&1
+  printf '\n[superhealth] ===== automatic install attempt %s =====\n' "$(date -Iseconds)"
 }
 
 install_local_command() {
@@ -161,6 +200,10 @@ install_local_command() {
 }
 
 configure_channel_from_local_messaging() {
+  if [[ -f "$DATA_DIR/control.db" ]]; then
+    log "Multi-user channel bindings are managed per user; skipping legacy global channel auto-config"
+    return
+  fi
   if [[ "${SUPERHEALTH_DISABLE_CHANNEL_AUTOCONFIG:-0}" == "1" ]]; then
     return
   fi
@@ -345,6 +388,62 @@ else:
 PY
 }
 
+provision_multiuser_openclaw() {
+  local install_mode="${1:-install}"
+
+  if [[ "$DEPLOYMENT_MODE" == "single" ]]; then
+    echo "Single-user mode was removed in v12; the runtime registry is control.db." >&2
+    echo "Re-run with DEPLOYMENT_MODE=multi." >&2
+    return 1
+  fi
+
+  # main → v12 upgrades are always migrated: the runtime registry is control.db
+  # and the legacy single-user layout no longer boots. Fresh installs and
+  # already-migrated installs continue through the provisioning path below.
+
+  log "Provisioning admin-only multi-user mode and the agent-bound OpenClaw plugin"
+  add_user_tool_paths
+  command -v openclaw >/dev/null 2>&1 || {
+    echo "OpenClaw is required. Configure WeCom and send one administrator message before installing SuperHealth." >&2
+    return 1
+  }
+  openclaw config set channels.wecom.dmPolicy open
+  openclaw config set channels.wecom.allowFrom '["*"]'
+
+  if [[ ! -x "$CURRENT_LINK/venv/bin/python3" ]]; then
+    python3 -m venv "$CURRENT_LINK/venv"
+  fi
+  "$CURRENT_LINK/venv/bin/python3" -m pip install -U pip
+  "$CURRENT_LINK/venv/bin/python3" -m pip install -e "$CURRENT_LINK"
+  if [[ "$install_mode" == "upgrade" && ! -f "$DATA_DIR/control.db" ]]; then
+    log "Legacy main-branch installation detected; running forced v12 migration"
+    backup_data >/dev/null
+    if ! "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/migrate_to_multiuser.py"; then
+      echo "Forced migration failed; restore the backup and retry." >&2
+      return 1
+    fi
+    DEPLOYMENT_MODE="multi"
+    persist_installer_config
+  elif [[ -f "$DATA_DIR/control.db" ]]; then
+    log "Existing multi-user registry detected; keeping all users unchanged"
+  fi
+  "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/bootstrap_multiuser.py"
+
+  # OpenClaw 2026.6+ rejects --force together with --link. Remove only the
+  # persisted registration first, then recreate the link to the active release.
+  if openclaw plugins inspect superhealth --json >/dev/null 2>&1; then
+    openclaw plugins uninstall --force --keep-files superhealth
+  fi
+  openclaw plugins install --link "$CURRENT_LINK/openclaw-plugin"
+  openclaw plugins enable superhealth
+  if [[ -f "$HOME/.openclaw/plugin-skills/superhealth-nutrition/SKILL.md" ]]; then
+    chmod 600 "$HOME/.openclaw/plugin-skills/superhealth-nutrition/SKILL.md"
+    mv "$HOME/.openclaw/plugin-skills/superhealth-nutrition/SKILL.md" \
+      "$HOME/.openclaw/plugin-skills/superhealth-nutrition/SKILL.md.disabled"
+  fi
+  openclaw gateway restart --force
+}
+
 require_ubuntu() {
   if [[ ! -f /etc/os-release ]]; then
     echo "Cannot detect OS: /etc/os-release not found" >&2
@@ -379,7 +478,7 @@ install_system_dependencies() {
   "${SUDO[@]}" apt-get update
 
   local packages=(
-    git curl wget ca-certificates openssh-client jq tar gzip unzip \
+    git curl wget ca-certificates openssh-client jq sqlite3 tar gzip unzip \
     python3 python3-pip python3-full python3-venv \
     fonts-wqy-zenhei fonts-wqy-microhei \
     libglib2.0-0 libnss3 libnspr4 \
@@ -725,6 +824,54 @@ validate_installation() {
 
   cd "$CURRENT_LINK"
   venv/bin/python3 -c "import superhealth.dashboard.app, superhealth.api.vitals_receiver, superhealth.daily_pipeline, superhealth.weekly_pipeline"
+  if [[ "$DEPLOYMENT_MODE" == "multi" ]]; then
+    test -f "$DATA_DIR/control.db"
+    [[ "$(stat -c '%a' "$DATA_DIR/control.db")" == "600" ]]
+    CONTROL_DB_PATH="$DATA_DIR/control.db" venv/bin/python3 - <<'PY'
+import os
+
+from superhealth.multiuser import control_db, registry
+
+conn = control_db.connect(os.environ["CONTROL_DB_PATH"])
+try:
+    users = registry.list_users(conn)
+    admins = [u for u in users if u.role == "admin" and u.status == "active"]
+    regulars = [u for u in users if u.role == "user" and u.status == "active"]
+    assert len(admins) == 1, f"expected exactly one active administrator, found {len(admins)}"
+    assert regulars, "expected at least one active regular user"
+    agent_ids = [u.agent_id for u in users]
+    assert len(agent_ids) == len(set(agent_ids)), "an OpenClaw agent is bound to multiple users"
+    for user in [*admins, *regulars]:
+        expected_use = "ops" if user.role == "admin" else "health"
+        rows = conn.execute(
+            "SELECT key_use FROM agent_keys WHERE agent_id=? AND status='active'",
+            (user.agent_id,),
+        ).fetchall()
+        assert [r["key_use"] for r in rows] == [expected_use], (
+            f"key invariant failed for {user.agent_id}"
+        )
+finally:
+    conn.close()
+PY
+    if [[ "${SUPERHEALTH_SKIP_OPENCLAW_VALIDATION:-0}" != "1" ]]; then
+      CONTROL_DB_PATH="$DATA_DIR/control.db" venv/bin/python3 -c "
+import os
+from superhealth.multiuser import control_db, registry
+conn = control_db.connect(os.environ['CONTROL_DB_PATH'])
+try:
+    admin = next(u for u in registry.list_users(conn) if u.role == 'admin' and u.status == 'active')
+    assert admin.agent_id == 'superhealth-admin'
+finally:
+    conn.close()
+"
+      add_user_tool_paths
+      systemctl --user is-active openclaw-gateway.service >/dev/null
+      openclaw plugins inspect superhealth --runtime --json | grep -q 'superhealth_chat'
+    fi
+  else
+    echo "Single-user mode was removed in v12; DEPLOYMENT_MODE must be multi." >&2
+    return 1
+  fi
   playwright_chromium_usable "$CURRENT_LINK/venv/bin/python3"
   bash scripts/manage_service.sh status dashboard
   bash scripts/manage_service.sh status vitals_receiver
@@ -747,13 +894,16 @@ install_telemetry_timer() {
     script_src="$(dirname "${SCRIPT_PATH:-$0}")/telemetry_report.sh"
   fi
   if [[ ! -f "$script_src" ]]; then
-    echo "telemetry_report.sh not found, skipping telemetry timer" >&2
-    return 0
+    echo "telemetry_report.sh not found" >&2
+    return 1
   fi
 
-  mkdir -p "$HOME/.local/bin"
-  cp "$script_src" "$HOME/.local/bin/telemetry_report.sh"
-  chmod +x "$HOME/.local/bin/telemetry_report.sh"
+  local script_dest="$HOME/.local/bin/telemetry_report.sh"
+  mkdir -p "$HOME/.local/bin" "$DATA_DIR/logs"
+  if [[ ! "$script_src" -ef "$script_dest" ]]; then
+    cp "$script_src" "$script_dest"
+  fi
+  chmod +x "$script_dest"
 
   mkdir -p "$HOME/.config/systemd/user"
   cat > "$HOME/.config/systemd/user/superhealth-telemetry.service" <<UNIT
@@ -794,6 +944,7 @@ install_flow() {
   start_install_logging
   trap report_install_failure EXIT
   run_stage preflight require_ubuntu
+  run_stage runtime_preflight validate_runtime_prerequisites
   run_stage sudo require_sudo
   run_stage system_dependencies install_system_dependencies
   run_stage user_linger enable_user_linger
@@ -810,6 +961,7 @@ install_flow() {
   report_install_event "$CURRENT_STAGE" "ok"
   run_stage stop_services stop_services
   run_stage activate_release activate_release "$version"
+  run_stage provision_multiuser provision_multiuser_openclaw install
   run_stage configure_channel configure_channel_from_local_messaging
   run_stage start_services start_services
   run_stage validate validate_installation
@@ -846,6 +998,7 @@ upgrade_flow() {
   if ! (
     stop_services
     activate_release "$version"
+    provision_multiuser_openclaw upgrade
     configure_channel_from_local_messaging
     start_services
     validate_installation
@@ -862,6 +1015,52 @@ upgrade_flow() {
 
   log "Upgraded to version: $version"
   log "Backup created before upgrade: $backup"
+}
+
+migrate_multiuser_flow() {
+  local skip_openclaw=0 arg
+  if [[ "$DEPLOYMENT_MODE" == "multi" && -f "$DATA_DIR/control.db" ]]; then
+    log "Deployment is already in multi-user mode"
+    return 0
+  fi
+  if [[ ! -x "$CURRENT_LINK/venv/bin/python3" ]]; then
+    echo "SuperHealth is not installed; install or upgrade before migration." >&2
+    return 1
+  fi
+
+  # --skip-openclaw is an installer-level flag; the v12 migration CLI only
+  # accepts --admin-username/--primary-username/--candidate-session-key/--workspace.
+  local forward_args=()
+  for arg in "$@"; do
+    case "$arg" in
+      --skip-openclaw) skip_openclaw=1 ;;
+      *) forward_args+=("$arg") ;;
+    esac
+  done
+
+  backup_data >/dev/null
+  stop_services
+  if ! "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/migrate_to_multiuser.py" "${forward_args[@]}"; then
+    start_services || true
+    return 1
+  fi
+  DEPLOYMENT_MODE="multi"
+  persist_installer_config
+  if [[ "$skip_openclaw" == "0" ]]; then
+    if ! provision_multiuser_openclaw upgrade; then
+      start_services || true
+      return 1
+    fi
+  else
+    log "OpenClaw provisioning skipped for this migration test"
+  fi
+  start_services
+  if [[ "$skip_openclaw" == "1" ]]; then
+    SUPERHEALTH_SKIP_OPENCLAW_VALIDATION=1 validate_installation
+  else
+    validate_installation
+  fi
+  log "Migration completed; deployment mode is now multi"
 }
 
 rollback_flow() {
@@ -900,6 +1099,8 @@ rollback_flow() {
 status_flow() {
   echo "install_root=$INSTALL_ROOT"
   echo "data_dir=$DATA_DIR"
+  echo "branch=$BRANCH"
+  echo "deployment_mode=$DEPLOYMENT_MODE"
   echo "current=$(current_version)"
   echo "releases:"
   ls -1 "$RELEASES_DIR" 2>/dev/null || true
@@ -914,13 +1115,51 @@ status_flow() {
 command="${1:-}"
 shift || true
 
+remaining_args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --branch)
+      [[ $# -ge 2 ]] || { echo "--branch requires a value" >&2; exit 2; }
+      BRANCH="$2"
+      shift 2
+      ;;
+    --branch=*)
+      BRANCH="${1#*=}"
+      shift
+      ;;
+    --mode)
+      [[ $# -ge 2 ]] || { echo "--mode requires single or multi" >&2; exit 2; }
+      DEPLOYMENT_MODE="$2"
+      shift 2
+      ;;
+    --mode=*)
+      DEPLOYMENT_MODE="${1#*=}"
+      shift
+      ;;
+    *)
+      remaining_args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ || "$BRANCH" == -* || "$BRANCH" == *..* ]]; then
+  echo "Invalid Git branch: $BRANCH" >&2
+  exit 2
+fi
+if [[ "$DEPLOYMENT_MODE" != "single" && "$DEPLOYMENT_MODE" != "multi" ]]; then
+  echo "Invalid deployment mode: $DEPLOYMENT_MODE (expected single or multi)" >&2
+  exit 2
+fi
+
 case "$command" in
   install) install_flow ;;
   upgrade) upgrade_flow ;;
-  rollback) rollback_flow "${1:-}" ;;
+  rollback) rollback_flow "${remaining_args[0]:-}" ;;
   backup) backup_data ;;
   status) status_flow ;;
   validate) validate_installation ;;
+  migrate-multiuser) migrate_multiuser_flow "${remaining_args[@]}" ;;
   -h|--help|"") usage ;;
   *)
     echo "Unknown command: $command" >&2

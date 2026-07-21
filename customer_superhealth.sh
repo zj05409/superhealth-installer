@@ -24,7 +24,7 @@ fi
 
 REPO_SSH_URL="${SUPERHEALTH_REPO_SSH_URL:-git@github.com-superhealth:chasezjj/superHealth.git}"
 BRANCH="${SUPERHEALTH_BRANCH:-main}"
-DEPLOYMENT_MODE="${SUPERHEALTH_DEPLOYMENT_MODE:-single}"
+DEPLOYMENT_MODE="${SUPERHEALTH_DEPLOYMENT_MODE:-multi}"
 INSTALL_ROOT="${SUPERHEALTH_INSTALL_ROOT:-$HOME/superHealth}"
 DATA_DIR="${SUPERHEALTH_DATA_DIR:-$HOME/.superhealth}"
 DEPLOY_KEY_PATH="${SUPERHEALTH_DEPLOY_KEY_PATH:-$HOME/.ssh/superhealth-deploy}"
@@ -200,7 +200,7 @@ install_local_command() {
 }
 
 configure_channel_from_local_messaging() {
-  if [[ -f "$DATA_DIR/users.toml" ]]; then
+  if [[ -f "$DATA_DIR/control.db" ]]; then
     log "Multi-user channel bindings are managed per user; skipping legacy global channel auto-config"
     return
   fi
@@ -392,20 +392,14 @@ provision_multiuser_openclaw() {
   local install_mode="${1:-install}"
 
   if [[ "$DEPLOYMENT_MODE" == "single" ]]; then
-    log "Single-user mode selected; skipping multi-user/OpenClaw provisioning"
-    return 0
+    echo "Single-user mode was removed in v12; the runtime registry is control.db." >&2
+    echo "Re-run with DEPLOYMENT_MODE=multi." >&2
+    return 1
   fi
 
-  # Updating an existing main-branch installation must not silently convert its
-  # global config/database into the new per-user layout. Multi-user migration is
-  # deliberately opt-in; fresh installs and already-migrated installs continue
-  # through the provisioning path below.
-  if [[ "$install_mode" == "upgrade" && ! -f "$DATA_DIR/users.toml" ]]; then
-    log "Legacy single-user installation detected; preserving config and database"
-    log "Skipping automatic migration during this upgrade"
-    log "Run: superhealth migrate-multiuser [migration options]"
-    return 0
-  fi
+  # main → v12 upgrades are always migrated: the runtime registry is control.db
+  # and the legacy single-user layout no longer boots. Fresh installs and
+  # already-migrated installs continue through the provisioning path below.
 
   log "Provisioning admin-only multi-user mode and the agent-bound OpenClaw plugin"
   add_user_tool_paths
@@ -421,7 +415,16 @@ provision_multiuser_openclaw() {
   fi
   "$CURRENT_LINK/venv/bin/python3" -m pip install -U pip
   "$CURRENT_LINK/venv/bin/python3" -m pip install -e "$CURRENT_LINK"
-  if [[ -f "$DATA_DIR/users.toml" ]]; then
+  if [[ "$install_mode" == "upgrade" && ! -f "$DATA_DIR/control.db" ]]; then
+    log "Legacy main-branch installation detected; running forced v12 migration"
+    backup_data >/dev/null
+    if ! "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/migrate_to_multiuser.py"; then
+      echo "Forced migration failed; restore the backup and retry." >&2
+      return 1
+    fi
+    DEPLOYMENT_MODE="multi"
+    persist_installer_config
+  elif [[ -f "$DATA_DIR/control.db" ]]; then
     log "Existing multi-user registry detected; keeping all users unchanged"
   fi
   "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/bootstrap_multiuser.py"
@@ -822,25 +825,52 @@ validate_installation() {
   cd "$CURRENT_LINK"
   venv/bin/python3 -c "import superhealth.dashboard.app, superhealth.api.vitals_receiver, superhealth.daily_pipeline, superhealth.weekly_pipeline"
   if [[ "$DEPLOYMENT_MODE" == "multi" ]]; then
-    test -f "$DATA_DIR/users.toml"
-    [[ "$(stat -c '%a' "$DATA_DIR/users.toml")" == "600" ]]
-    venv/bin/python3 - <<'PY'
-from superhealth.user_context import UserRegistry
+    test -f "$DATA_DIR/control.db"
+    [[ "$(stat -c '%a' "$DATA_DIR/control.db")" == "600" ]]
+    CONTROL_DB_PATH="$DATA_DIR/control.db" venv/bin/python3 - <<'PY'
+import os
 
-users = UserRegistry.load_registry()
-admins = [user for user in users.values() if user.is_admin]
-assert len(admins) == 1, f"expected exactly one administrator, found {len(admins)}"
-agent_ids = [user.openclaw_agent_id for user in users.values() if user.openclaw_agent_id]
-assert len(agent_ids) == len(set(agent_ids)), "an OpenClaw agent is bound to multiple users"
+from superhealth.multiuser import control_db, registry
+
+conn = control_db.connect(os.environ["CONTROL_DB_PATH"])
+try:
+    users = registry.list_users(conn)
+    admins = [u for u in users if u.role == "admin" and u.status == "active"]
+    regulars = [u for u in users if u.role == "user" and u.status == "active"]
+    assert len(admins) == 1, f"expected exactly one active administrator, found {len(admins)}"
+    assert regulars, "expected at least one active regular user"
+    agent_ids = [u.agent_id for u in users]
+    assert len(agent_ids) == len(set(agent_ids)), "an OpenClaw agent is bound to multiple users"
+    for user in [*admins, *regulars]:
+        expected_use = "ops" if user.role == "admin" else "health"
+        rows = conn.execute(
+            "SELECT key_use FROM agent_keys WHERE agent_id=? AND status='active'",
+            (user.agent_id,),
+        ).fetchall()
+        assert [r["key_use"] for r in rows] == [expected_use], (
+            f"key invariant failed for {user.agent_id}"
+        )
+finally:
+    conn.close()
 PY
     if [[ "${SUPERHEALTH_SKIP_OPENCLAW_VALIDATION:-0}" != "1" ]]; then
-      venv/bin/python3 -c "from superhealth.user_context import UserRegistry; assert next(user for user in UserRegistry.list_users() if user.is_admin).openclaw_agent_id"
+      CONTROL_DB_PATH="$DATA_DIR/control.db" venv/bin/python3 -c "
+import os
+from superhealth.multiuser import control_db, registry
+conn = control_db.connect(os.environ['CONTROL_DB_PATH'])
+try:
+    admin = next(u for u in registry.list_users(conn) if u.role == 'admin' and u.status == 'active')
+    assert admin.agent_id == 'superhealth-admin'
+finally:
+    conn.close()
+"
       add_user_tool_paths
       systemctl --user is-active openclaw-gateway.service >/dev/null
       openclaw plugins inspect superhealth --runtime --json | grep -q 'superhealth_chat'
     fi
   else
-    test ! -e "$DATA_DIR/users.toml"
+    echo "Single-user mode was removed in v12; DEPLOYMENT_MODE must be multi." >&2
+    return 1
   fi
   playwright_chromium_usable "$CURRENT_LINK/venv/bin/python3"
   bash scripts/manage_service.sh status dashboard
@@ -989,7 +1019,7 @@ upgrade_flow() {
 
 migrate_multiuser_flow() {
   local skip_openclaw=0 arg
-  if [[ "$DEPLOYMENT_MODE" == "multi" && -f "$DATA_DIR/users.toml" ]]; then
+  if [[ "$DEPLOYMENT_MODE" == "multi" && -f "$DATA_DIR/control.db" ]]; then
     log "Deployment is already in multi-user mode"
     return 0
   fi
@@ -998,17 +1028,24 @@ migrate_multiuser_flow() {
     return 1
   fi
 
+  # --skip-openclaw is an installer-level flag; the v12 migration CLI only
+  # accepts --admin-username/--primary-username/--candidate-session-key/--workspace.
+  local forward_args=()
+  for arg in "$@"; do
+    case "$arg" in
+      --skip-openclaw) skip_openclaw=1 ;;
+      *) forward_args+=("$arg") ;;
+    esac
+  done
+
   backup_data >/dev/null
   stop_services
-  if ! "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/migrate_to_multiuser.py" "$@"; then
+  if ! "$CURRENT_LINK/venv/bin/python3" "$CURRENT_LINK/scripts/migrate_to_multiuser.py" "${forward_args[@]}"; then
     start_services || true
     return 1
   fi
   DEPLOYMENT_MODE="multi"
   persist_installer_config
-  for arg in "$@"; do
-    [[ "$arg" == "--skip-openclaw" ]] && skip_openclaw=1
-  done
   if [[ "$skip_openclaw" == "0" ]]; then
     if ! provision_multiuser_openclaw upgrade; then
       start_services || true

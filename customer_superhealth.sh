@@ -56,6 +56,7 @@ add_user_tool_paths() {
   local dir
   for dir in \
     "$HOME/.local/bin" \
+    "$HOME/.local/share/pnpm/bin" \
     "$HOME/.local/share/pnpm" \
     "$HOME/.npm-global/bin" \
     "$HOME/.nvm/current/bin" \
